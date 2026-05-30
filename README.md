@@ -74,6 +74,39 @@ await gateway.start();
 // 🚀 Jaunt Gateway listening on http://0.0.0.0:3000
 ```
 
+// HTTP/1.1 upstream — unchanged, no migration needed
+```typescript
+gateway.addRoute({
+  method: 'GET',
+  path: '/api/users/:id',
+  upstream: 'http://user-service:3000',
+});
+```
+
+// HTTP/2 upstream — simple
+```typescript
+gateway.addRoute({
+  method: 'POST',
+  path: '/api/orders',
+  upstream: 'https://order-service:4000',
+  http2: true,
+});
+```
+
+// HTTP/2 upstream — with custom timeouts and self-signed cert
+```typescript
+gateway.addRoute({
+  method: 'GET',
+  path: '/api/inventory',
+  upstream: 'https://inventory-service:5000',
+  http2: {
+    sessionTimeout: 30_000,
+    requestTimeout: 5_000,
+    rejectUnauthorized: false, // dev only
+  },
+});
+```
+
 ---
 
 ## Request Lifecycle

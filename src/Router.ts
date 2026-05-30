@@ -72,6 +72,8 @@ export class Router {
   public add(route: RouteDefinition): void {
     const store: RouteStore = {
       upstream: route.upstream,
+      // Normalise: undefined → false so downstream code never has to null-check.
+      http2: route.http2 ?? false,
       // Default to an empty array so downstream code never has to null-check.
       plugins: route.plugins ?? [],
     };

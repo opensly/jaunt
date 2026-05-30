@@ -8,6 +8,56 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 // ---------------------------------------------------------------------------
+// HTTP/2 upstream options
+// ---------------------------------------------------------------------------
+
+/**
+ * Configuration for connecting to an HTTP/2 upstream service.
+ *
+ * When a route sets `http2: true` (or provides this object), Jaunt opens a
+ * persistent HTTP/2 session to the upstream origin and multiplexes all
+ * matching requests over it — eliminating per-request TCP + TLS overhead.
+ *
+ * The inbound client connection always uses HTTP/1.1; this option only
+ * controls the **outbound** (gateway → upstream) protocol.
+ *
+ * @example
+ * // Simple boolean — use defaults
+ * gateway.addRoute({ ..., http2: true });
+ *
+ * // Fine-grained control
+ * gateway.addRoute({
+ *   ...,
+ *   http2: {
+ *     sessionTimeout: 30_000,
+ *     requestTimeout: 10_000,
+ *     rejectUnauthorized: true,
+ *   },
+ * });
+ */
+export interface Http2UpstreamOptions {
+  /**
+   * How long (ms) an idle HTTP/2 session is kept open before being destroyed.
+   * A new session is created automatically on the next request.
+   * @default 60000
+   */
+  sessionTimeout?: number;
+
+  /**
+   * Per-request timeout (ms) for the upstream HTTP/2 stream.
+   * @default 10000
+   */
+  requestTimeout?: number;
+
+  /**
+   * Whether to reject upstreams with self-signed or invalid TLS certificates.
+   * Set to `false` in development when using self-signed certs.
+   * @default false
+   */
+  rejectUnauthorized?: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
 
@@ -123,6 +173,19 @@ export interface RouteDefinition {
   upstream: string;
 
   /**
+   * Enable HTTP/2 for the outbound connection to this upstream.
+   *
+   * - `true` — use HTTP/2 with default session/request timeouts.
+   * - `Http2UpstreamOptions` — use HTTP/2 with custom timeout and TLS settings.
+   * - `false` / omitted — use HTTP/1.1 (default).
+   *
+   * The inbound client connection is always HTTP/1.1 regardless of this setting.
+   * Jaunt maintains one persistent HTTP/2 session per unique upstream origin,
+   * shared across all routes that target the same origin.
+   */
+  http2?: boolean | Http2UpstreamOptions;
+
+  /**
    * An optional ordered array of plugin middleware functions executed
    * before the request is forwarded to the upstream service.
    * Plugins run in the order they are declared.
@@ -178,6 +241,12 @@ export interface GatewayOptions {
 export interface RouteStore {
   /** The resolved upstream base URL for this route. */
   upstream: string;
+
+  /**
+   * HTTP/2 upstream config for this route, if enabled.
+   * `false` means use HTTP/1.1 (undici). Truthy means use HTTP/2.
+   */
+  http2: boolean | Http2UpstreamOptions;
 
   /** The ordered plugin chain for this specific route. */
   plugins: Plugin[];

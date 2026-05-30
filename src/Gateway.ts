@@ -8,15 +8,19 @@
  *  3. For every incoming request, execute the full lifecycle:
  *       a. Route matching via find-my-way (O(log n) Radix-tree lookup).
  *       b. Middleware pipeline execution (onion model).
- *       c. Upstream proxying via @fastify/reply-from's internal transport
- *          (undici-backed, streaming, low-latency).
+ *       c. Upstream proxying — HTTP/1.1 via undici or HTTP/2 via a persistent
+ *          h2 session, selected per-route.
  *  4. Handle errors and edge cases (404, 500) with minimal allocations.
  *
- * Proxy layer migration note:
- *  fast-proxy was deprecated upstream (replaced by @fastify/http-proxy).
- *  We now use the framework-agnostic `buildRequest` transport from
- *  @fastify/reply-from/lib/request directly, which is the same undici-backed
- *  engine without requiring Fastify as a peer dependency.
+ * HTTP/2 upstream support:
+ *  Routes may set `http2: true` (or an `Http2UpstreamOptions` object) to have
+ *  Jaunt open a persistent HTTP/2 session to the upstream origin. The inbound
+ *  client connection always uses HTTP/1.1 — this is a pure h1→h2 bridge.
+ *
+ *  Jaunt maintains one transport instance per unique upstream origin+protocol
+ *  combination. Transports are created lazily on first use and reused for all
+ *  subsequent requests to the same origin, giving connection multiplexing for
+ *  HTTP/2 and connection pooling for HTTP/1.1.
  */
 
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
@@ -25,8 +29,6 @@ import { pipeline } from 'node:stream';
 
 // ---------------------------------------------------------------------------
 // ANSI color helpers — no third-party dependencies needed.
-// These wrap a string with the escape code for the given color and always
-// reset to default at the end, so surrounding text is never affected.
 // ---------------------------------------------------------------------------
 const ansi = {
   cyan:   (s: string) => `\x1b[36m${s}\x1b[0m`,
@@ -37,11 +39,16 @@ const ansi = {
 // ---------------------------------------------------------------------------
 // @fastify/reply-from internal transport
 //
-// buildRequest is the framework-agnostic undici/http transport layer inside
+// buildRequest is the framework-agnostic undici/http2 transport layer inside
 // @fastify/reply-from. It has no dependency on Fastify's request/reply
 // objects — it only needs a plain URL and headers, and returns a streaming
-// response via callback. We use it directly here to avoid the Fastify plugin
-// wrapper while still benefiting from the maintained undici connection pool.
+// response via callback.
+//
+// For HTTP/1.1 routes we create one shared transport with no fixed base,
+// letting undici's agent pool handle connections to any upstream.
+//
+// For HTTP/2 routes, buildRequest requires a fixed `base` URL (one h2 session
+// per origin), so we maintain a registry keyed by upstream origin.
 // ---------------------------------------------------------------------------
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const buildRequest = require('@fastify/reply-from/lib/request') as (
@@ -49,8 +56,13 @@ const buildRequest = require('@fastify/reply-from/lib/request') as (
 ) => ReplyFromRequestResult;
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { stripHttp1ConnectionHeaders } = require('@fastify/reply-from/lib/utils') as {
-  stripHttp1ConnectionHeaders: (headers: Record<string, string | string[] | undefined>) => Record<string, string | string[] | undefined>;
+const { stripHttp1ConnectionHeaders, filterPseudoHeaders } = require('@fastify/reply-from/lib/utils') as {
+  stripHttp1ConnectionHeaders: (
+    headers: Record<string, string | string[] | undefined>
+  ) => Record<string, string | string[] | undefined>;
+  filterPseudoHeaders: (
+    headers: Record<string, string | string[] | undefined>
+  ) => Record<string, string | string[] | undefined>;
 };
 
 import { Router } from './Router';
@@ -58,19 +70,28 @@ import { composePipeline } from './pipeline';
 import type {
   GatewayContext,
   GatewayOptions,
+  Http2UpstreamOptions,
   Plugin,
   RouteDefinition,
 } from './types';
 
 // ---------------------------------------------------------------------------
 // Type shims for @fastify/reply-from internal API
-// (the lib/ internals are not covered by the package's public .d.ts)
+// (lib/ internals are not covered by the package's public .d.ts)
 // ---------------------------------------------------------------------------
 
+interface ReplyFromHttp2Options {
+  sessionTimeout?: number;
+  requestTimeout?: number;
+  sessionOptions?: { rejectUnauthorized?: boolean };
+}
+
 interface ReplyFromRequestOptions {
-  /** No fixed base — we resolve the full URL per request for multi-upstream support. */
+  /** Fixed upstream origin — required when http2 is enabled. */
   base?: string;
-  /** Undici connection pool options. */
+  /** Pass truthy/object to use the HTTP/2 transport. */
+  http2?: boolean | ReplyFromHttp2Options;
+  /** Undici connection pool options (HTTP/1.1 only). */
   undici?: {
     connections?: number;
     pipelining?: number;
@@ -81,7 +102,7 @@ interface ReplyFromRequestOptions {
 interface UpstreamResponse {
   statusCode: number;
   headers: Record<string, string | string[] | undefined>;
-  /** The upstream response body as a readable stream. */
+  /** Readable stream of the upstream response body. */
   stream: IncomingMessage;
 }
 
@@ -104,6 +125,15 @@ interface ReplyFromRequestResult {
 }
 
 // ---------------------------------------------------------------------------
+// Transport registry entry
+// ---------------------------------------------------------------------------
+
+interface TransportEntry {
+  requestFn: RequestFn;
+  close: () => void;
+}
+
+// ---------------------------------------------------------------------------
 // Gateway
 // ---------------------------------------------------------------------------
 
@@ -113,11 +143,20 @@ interface ReplyFromRequestResult {
  * @example
  * const gateway = new Gateway({ port: 8080 });
  *
+ * // HTTP/1.1 upstream (default)
  * gateway.addRoute({
  *   method: 'GET',
  *   path: '/api/users/:id',
  *   upstream: 'http://user-service:3000',
  *   plugins: [authPlugin],
+ * });
+ *
+ * // HTTP/2 upstream
+ * gateway.addRoute({
+ *   method: 'GET',
+ *   path: '/api/orders',
+ *   upstream: 'https://order-service:4000',
+ *   http2: true,
  * });
  *
  * await gateway.start();
@@ -128,15 +167,19 @@ export class Gateway {
   private readonly server: http.Server;
 
   /**
-   * The undici-backed request transport from @fastify/reply-from.
-   * Initialised on `start()`. Kept as a single instance with no fixed base
-   * so we can proxy to multiple different upstreams per request.
+   * Shared HTTP/1.1 transport (undici-backed, no fixed base).
+   * Initialised on `start()`.
    */
-  private requestFn!: RequestFn;
-  private closeTransport!: () => void;
+  private h1Transport!: TransportEntry;
+
+  /**
+   * Per-origin HTTP/2 transport registry.
+   * Key: upstream origin string (e.g. 'https://order-service:4000').
+   * Created lazily on first request to each h2 upstream.
+   */
+  private readonly h2Transports = new Map<string, TransportEntry>();
 
   constructor(options: GatewayOptions = {}) {
-    // Apply defaults for every optional config key.
     this.options = {
       port: options.port ?? 3000,
       host: options.host ?? '0.0.0.0',
@@ -146,8 +189,6 @@ export class Gateway {
 
     this.router = new Router();
 
-    // Create the HTTP server and bind the request handler.
-    // Arrow function preserves `this` without an explicit bind call.
     this.server = http.createServer((req, res) => {
       void this.handleRequest(req, res);
     });
@@ -159,24 +200,23 @@ export class Gateway {
 
   /**
    * Registers a route with the gateway.
-   * Routes can be added before or after `start()` is called, enabling
-   * dynamic route registration at runtime.
+   * Routes can be added before or after `start()` is called.
    *
    * @param route - The route definition to register.
    */
   public addRoute(route: RouteDefinition): this {
     this.router.add(route);
-    return this; // Fluent API — allows chaining multiple addRoute() calls.
+    return this;
   }
 
   /**
-   * Starts the HTTP server and initialises the proxy transport.
+   * Starts the HTTP server and initialises the HTTP/1.1 proxy transport.
+   * HTTP/2 transports are created lazily on first use.
    *
    * @returns A promise that resolves once the server is listening.
    */
   public start(): Promise<void> {
-    // Initialise the undici transport with no fixed base URL so we can proxy
-    // to multiple different upstreams from a single gateway instance.
+    // Shared HTTP/1.1 transport — no fixed base, undici agent handles pooling.
     const { request, close } = buildRequest({
       undici: {
         connections: 100,
@@ -184,8 +224,7 @@ export class Gateway {
       },
     });
 
-    this.requestFn = request;
-    this.closeTransport = close;
+    this.h1Transport = { requestFn: request, close };
 
     return new Promise((resolve) => {
       this.server.listen(this.options.port, this.options.host, () => {
@@ -200,16 +239,21 @@ export class Gateway {
   }
 
   /**
-   * Gracefully shuts down the HTTP server and closes the proxy connection pool.
+   * Gracefully shuts down the HTTP server and closes all proxy transports
+   * (both the shared HTTP/1.1 pool and every HTTP/2 session).
    *
    * @returns A promise that resolves once the server has fully closed.
    */
   public stop(): Promise<void> {
     return new Promise((resolve, reject) => {
-      // Drain the undici connection pool before closing the HTTP server.
-      if (this.closeTransport) {
-        this.closeTransport();
+      // Close the HTTP/1.1 undici pool.
+      this.h1Transport?.close();
+
+      // Destroy every HTTP/2 session.
+      for (const [, entry] of this.h2Transports) {
+        entry.close();
       }
+      this.h2Transports.clear();
 
       this.server.close((err) => {
         if (err) {
@@ -233,73 +277,48 @@ export class Gateway {
    *  1. Match the request URL against the Radix-tree route table.
    *  2. Build a GatewayContext with request metadata.
    *  3. Compose and execute the middleware pipeline (global + route-level).
-   *  4. Stream the request to the upstream via the undici transport.
-   *
-   * @param req - Native Node.js IncomingMessage.
-   * @param res - Native Node.js ServerResponse.
+   *  4. Proxy to upstream via HTTP/1.1 (undici) or HTTP/2, per route config.
    */
   private async handleRequest(
     req: IncomingMessage,
     res: ServerResponse
   ): Promise<void> {
-    // ------------------------------------------------------------------
     // Step 1: Route matching
-    // ------------------------------------------------------------------
     const match = this.router.match(req);
-
     if (!match) {
       this.sendError(res, 404, 'Not Found');
       return;
     }
 
-    // ------------------------------------------------------------------
     // Step 2: Build context
-    // ------------------------------------------------------------------
-    const query = this.parseQuery(req.url ?? '/');
-
     const ctx: GatewayContext = {
       req,
       res,
       params: match.params,
-      query,
+      query: this.parseQuery(req.url ?? '/'),
       upstream: match.store.upstream,
       state: {},
     };
 
-    // ------------------------------------------------------------------
-    // Step 3: Compose and run the middleware pipeline
-    //
-    // Global plugins run first, followed by route-specific plugins.
-    // This mirrors how frameworks like Koa handle global vs. router-level
-    // middleware.
-    // ------------------------------------------------------------------
+    // Step 3: Middleware pipeline
     const allPlugins: Plugin[] = [
       ...this.options.globalPlugins,
       ...match.store.plugins,
     ];
 
-    const runPipeline = composePipeline(allPlugins);
-
     try {
-      await runPipeline(ctx);
+      await composePipeline(allPlugins)(ctx);
     } catch (err) {
-      // A plugin threw — log and return 500 before attempting to proxy.
       console.error('[Jaunt] Plugin pipeline error:', err);
       this.sendError(res, 500, 'Internal Server Error');
       return;
     }
 
-    // If a plugin already sent a response (e.g. an auth plugin returning 401),
-    // do not attempt to proxy the request.
-    if (res.writableEnded) {
-      return;
-    }
+    if (res.writableEnded) return;
 
-    // ------------------------------------------------------------------
-    // Step 4: Proxy to upstream
-    // ------------------------------------------------------------------
+    // Step 4: Proxy
     try {
-      await this.proxyRequest(ctx);
+      await this.proxyRequest(ctx, match.store.http2);
     } catch (err) {
       console.error('[Jaunt] Proxy error:', err);
       if (!res.writableEnded) {
@@ -308,42 +327,113 @@ export class Gateway {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Proxy
+  // ---------------------------------------------------------------------------
+
   /**
-   * Streams the request to the upstream service using the undici transport
-   * from @fastify/reply-from.
+   * Proxies the request to the upstream service.
    *
-   * The transport handles:
-   *  - Forwarding all original headers (with hop-by-hop headers stripped).
-   *  - Streaming the request body without buffering.
-   *  - Streaming the upstream response body back to the client.
+   * Selects the correct transport based on the route's `http2` setting:
+   *  - Falsy → shared HTTP/1.1 undici transport.
+   *  - Truthy → per-origin HTTP/2 transport (created lazily, then reused).
    *
-   * @param ctx - The populated GatewayContext for this request.
+   * @param ctx      - The populated GatewayContext for this request.
+   * @param http2Cfg - The route's http2 setting from RouteStore.
    */
-  private proxyRequest(ctx: GatewayContext): Promise<void> {
+  private proxyRequest(
+    ctx: GatewayContext,
+    http2Cfg: boolean | Http2UpstreamOptions
+  ): Promise<void> {
+    const transport = http2Cfg
+      ? this.getOrCreateH2Transport(ctx.upstream, http2Cfg)
+      : this.h1Transport;
+
+    return this.dispatchRequest(ctx, transport);
+  }
+
+  /**
+   * Returns the cached HTTP/2 transport for the given upstream origin,
+   * creating and caching a new one if this is the first request to that origin.
+   *
+   * One HTTP/2 session is maintained per unique upstream origin. All routes
+   * targeting the same origin share the session, giving full h2 multiplexing.
+   *
+   * @param upstream  - The upstream base URL string.
+   * @param http2Cfg  - The route's http2 setting (true or options object).
+   */
+  private getOrCreateH2Transport(
+    upstream: string,
+    http2Cfg: boolean | Http2UpstreamOptions
+  ): TransportEntry {
+    const origin = new URL(upstream).origin;
+
+    const existing = this.h2Transports.get(origin);
+    if (existing) return existing;
+
+    // Normalise the http2 config into the shape buildRequest expects.
+    const h2Opts: ReplyFromHttp2Options =
+      typeof http2Cfg === 'object' && http2Cfg !== null
+        ? {
+            sessionTimeout: http2Cfg.sessionTimeout,
+            requestTimeout: http2Cfg.requestTimeout,
+            sessionOptions: {
+              rejectUnauthorized: http2Cfg.rejectUnauthorized,
+            },
+          }
+        : {};
+
+    const { request, close } = buildRequest({
+      base: origin,
+      http2: Object.keys(h2Opts).length > 0 ? h2Opts : true,
+    });
+
+    const entry: TransportEntry = { requestFn: request, close };
+    this.h2Transports.set(origin, entry);
+
+    console.log(`[Jaunt] HTTP/2 transport created for ${ansi.cyan(origin)}`);
+    return entry;
+  }
+
+  /**
+   * Sends the request through the given transport and pipes the upstream
+   * response stream back to the client.
+   *
+   * For HTTP/2 upstreams the response `stream` is a `ClientHttp2Stream`
+   * (readable after the `response` event). For HTTP/1.1 it is an
+   * `IncomingMessage`. Both are Node.js `Readable` streams, so `pipeline`
+   * handles both identically.
+   *
+   * HTTP/2 response headers include `:status` and other pseudo-headers
+   * (prefixed with `:`). These are filtered out before writing to the
+   * HTTP/1.1 client response, since pseudo-headers are not valid in h1.
+   *
+   * @param ctx       - The populated GatewayContext.
+   * @param transport - The resolved transport entry to use.
+   */
+  private dispatchRequest(
+    ctx: GatewayContext,
+    transport: TransportEntry
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
       const rawUrl = ctx.req.url ?? '/';
       const upstreamUrl = this.buildUpstreamUrl(ctx.upstream, rawUrl);
-
-      // Extract the query string portion to pass separately, as the transport
-      // expects the path and query string to be provided independently.
       const qs = upstreamUrl.search;
 
-      // Strip hop-by-hop headers (Connection, Transfer-Encoding, etc.) before
-      // forwarding, then inject the gateway identification header.
+      // Strip hop-by-hop headers before forwarding, then inject the
+      // gateway identification header and correct Host.
       const forwardHeaders = stripHttp1ConnectionHeaders({
         ...ctx.req.headers,
       } as Record<string, string | string[] | undefined>);
       forwardHeaders['x-forwarded-by'] = 'jaunt-gateway';
       forwardHeaders['host'] = upstreamUrl.host;
 
-      this.requestFn(
+      transport.requestFn(
         {
           method: ctx.req.method ?? 'GET',
           url: upstreamUrl,
           qs,
           headers: forwardHeaders,
-          // Pass the raw IncomingMessage as the body stream so the transport
-          // can pipe it directly without buffering.
           body: ctx.req,
           timeout: this.options.proxyTimeout,
         },
@@ -353,21 +443,27 @@ export class Gateway {
             return;
           }
 
-          // Write the upstream status and headers to the client response.
+          // Filter out HTTP/2 pseudo-headers (`:status`, `:path`, etc.)
+          // before writing to the HTTP/1.1 client response — they are
+          // illegal in HTTP/1.1 and would cause a write error.
+          const safeHeaders = filterPseudoHeaders(
+            upstreamRes.headers as Record<string, string | string[] | undefined>
+          );
+
           const outHeaders: Record<string, string | string[]> = {};
-          for (const [key, value] of Object.entries(upstreamRes.headers)) {
+          for (const [key, value] of Object.entries(safeHeaders)) {
             if (value !== undefined) {
               outHeaders[key] = value;
             }
           }
+
           ctx.res.writeHead(upstreamRes.statusCode, outHeaders);
 
-          // Stream the upstream response body directly to the client.
-          // `pipeline` handles cleanup on error or early close.
+          // Stream the upstream response body to the client without buffering.
           pipeline(upstreamRes.stream, ctx.res, (pipeErr) => {
             if (pipeErr) {
-              // The client may have disconnected mid-stream; log but don't
-              // reject since the response head was already sent.
+              // Client may have disconnected mid-stream; the response head
+              // was already sent so we can only log, not send an error.
               console.error('[Jaunt] Stream pipeline error:', pipeErr);
             }
             resolve();
@@ -383,30 +479,17 @@ export class Gateway {
 
   /**
    * Constructs the full upstream target URL object.
-   *
-   * Combines the upstream base origin with the incoming request's path
-   * and query string.
-   *
-   * @param upstream - The upstream base URL (e.g. 'http://user-service:3000').
-   * @param requestUrl - The raw request URL including path and query string.
-   * @returns A parsed URL pointing at the upstream target.
    */
   private buildUpstreamUrl(upstream: string, requestUrl: string): URL {
     const base = new URL(upstream);
-    // Resolve the incoming path against the upstream origin.
-    // Using the URL constructor handles edge cases like double slashes.
     return new URL(requestUrl, base.origin);
   }
 
   /**
    * Parses the query string from a raw URL into a plain key/value map.
-   *
-   * @param rawUrl - The raw request URL string (e.g. '/search?q=hello&page=2').
-   * @returns A flat record of query parameter key/value pairs.
    */
   private parseQuery(rawUrl: string): Record<string, string> {
     try {
-      // Use a dummy base so URL can parse relative paths.
       const { searchParams } = new URL(rawUrl, 'http://localhost');
       const query: Record<string, string> = {};
       searchParams.forEach((value, key) => {
@@ -420,10 +503,6 @@ export class Gateway {
 
   /**
    * Sends a JSON HTTP error response and ends the response stream.
-   *
-   * @param res - The ServerResponse to write to.
-   * @param statusCode - HTTP status code (e.g. 404, 500).
-   * @param message - Human-readable error message.
    */
   private sendError(
     res: ServerResponse,

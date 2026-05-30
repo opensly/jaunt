@@ -21,4 +21,5 @@ export type {
   RouteStore,
   Plugin,
   HttpMethod,
+  Http2UpstreamOptions,
 } from './types';
