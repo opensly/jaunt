@@ -1,7 +1,7 @@
 {
   "name": "jaunt",
   "version": "1.0.0",
-  "description": "A lightweight API Gateway core built on Node.js native HTTP, find-my-way, and fast-proxy.",
+  "description": "A lightweight API Gateway core built on Node.js native HTTP, find-my-way, and @fastify/reply-from.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -25,13 +25,13 @@
     "nodejs",
     "typescript",
     "find-my-way",
-    "fast-proxy",
+    "@fastify/reply-from",
     "jaunt"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "fast-proxy": "^1.0.0",
+    "@fastify/reply-from": "^12.6.2",
     "find-my-way": "^9.2.0"
   },
   "devDependencies": {

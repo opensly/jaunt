@@ -8,12 +8,20 @@
  *  3. For every incoming request, execute the full lifecycle:
  *       a. Route matching via find-my-way (O(log n) Radix-tree lookup).
  *       b. Middleware pipeline execution (onion model).
- *       c. Upstream proxying via fast-proxy (streaming, low-latency).
+ *       c. Upstream proxying via @fastify/reply-from's internal transport
+ *          (undici-backed, streaming, low-latency).
  *  4. Handle errors and edge cases (404, 500) with minimal allocations.
+ *
+ * Proxy layer migration note:
+ *  fast-proxy was deprecated upstream (replaced by @fastify/http-proxy).
+ *  We now use the framework-agnostic `buildRequest` transport from
+ *  @fastify/reply-from/lib/request directly, which is the same undici-backed
+ *  engine without requiring Fastify as a peer dependency.
  */
 
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
+import { pipeline } from 'node:stream';
 
 // ---------------------------------------------------------------------------
 // ANSI color helpers — no third-party dependencies needed.
@@ -21,19 +29,29 @@ import { URL } from 'node:url';
 // reset to default at the end, so surrounding text is never affected.
 // ---------------------------------------------------------------------------
 const ansi = {
-  green:  (s: string) => `\x1b[32m${s}\x1b[0m`,
   cyan:   (s: string) => `\x1b[36m${s}\x1b[0m`,
   yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
   bold:   (s: string) => `\x1b[1m${s}\x1b[0m`,
 };
 
-// fast-proxy ships a default export that is a factory function.
-// We use a dynamic require here because the package's CJS/ESM interop
-// does not expose named TypeScript types — the cast below keeps us safe.
+// ---------------------------------------------------------------------------
+// @fastify/reply-from internal transport
+//
+// buildRequest is the framework-agnostic undici/http transport layer inside
+// @fastify/reply-from. It has no dependency on Fastify's request/reply
+// objects — it only needs a plain URL and headers, and returns a streaming
+// response via callback. We use it directly here to avoid the Fastify plugin
+// wrapper while still benefiting from the maintained undici connection pool.
+// ---------------------------------------------------------------------------
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const buildFastProxy = require('fast-proxy') as (
-  opts: FastProxyOptions
-) => { proxy: FastProxyFn; close: () => void };
+const buildRequest = require('@fastify/reply-from/lib/request') as (
+  opts: ReplyFromRequestOptions
+) => ReplyFromRequestResult;
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { stripHttp1ConnectionHeaders } = require('@fastify/reply-from/lib/utils') as {
+  stripHttp1ConnectionHeaders: (headers: Record<string, string | string[] | undefined>) => Record<string, string | string[] | undefined>;
+};
 
 import { Router } from './Router';
 import { composePipeline } from './pipeline';
@@ -45,25 +63,45 @@ import type {
 } from './types';
 
 // ---------------------------------------------------------------------------
-// fast-proxy type shims
-// (fast-proxy does not ship its own @types package)
+// Type shims for @fastify/reply-from internal API
+// (the lib/ internals are not covered by the package's public .d.ts)
 // ---------------------------------------------------------------------------
 
-interface FastProxyOptions {
-  /** Base URL of the upstream — fast-proxy uses this for connection reuse. */
+interface ReplyFromRequestOptions {
+  /** No fixed base — we resolve the full URL per request for multi-upstream support. */
   base?: string;
-  /** Proxy request timeout in milliseconds. */
-  timeout?: number;
-  /** Undici/http agent options forwarded to the underlying HTTP client. */
-  undici?: Record<string, unknown>;
+  /** Undici connection pool options. */
+  undici?: {
+    connections?: number;
+    pipelining?: number;
+    keepAliveTimeout?: number;
+  };
 }
 
-type FastProxyFn = (
-  req: IncomingMessage,
-  res: ServerResponse,
-  source: string,
-  opts?: Record<string, unknown>
+interface UpstreamResponse {
+  statusCode: number;
+  headers: Record<string, string | string[] | undefined>;
+  /** The upstream response body as a readable stream. */
+  stream: IncomingMessage;
+}
+
+type RequestFn = (
+  opts: {
+    method: string;
+    url: URL;
+    qs: string;
+    headers: Record<string, string | string[] | undefined>;
+    body: IncomingMessage | string | undefined;
+    timeout: number;
+  },
+  cb: (err: Error | null, res: UpstreamResponse) => void
 ) => void;
+
+interface ReplyFromRequestResult {
+  request: RequestFn;
+  close: () => void;
+  retryOnError: string;
+}
 
 // ---------------------------------------------------------------------------
 // Gateway
@@ -90,13 +128,12 @@ export class Gateway {
   private readonly server: http.Server;
 
   /**
-   * fast-proxy instance. Initialised lazily on `start()` so the upstream
-   * base URL can be set per-request rather than globally.
-   * We keep a single instance with no fixed `base` and pass the full URL
-   * per proxy call, which lets us support multiple upstreams.
+   * The undici-backed request transport from @fastify/reply-from.
+   * Initialised on `start()`. Kept as a single instance with no fixed base
+   * so we can proxy to multiple different upstreams per request.
    */
-  private proxy!: FastProxyFn;
-  private closeProxy!: () => void;
+  private requestFn!: RequestFn;
+  private closeTransport!: () => void;
 
   constructor(options: GatewayOptions = {}) {
     // Apply defaults for every optional config key.
@@ -133,24 +170,22 @@ export class Gateway {
   }
 
   /**
-   * Starts the HTTP server and initialises the proxy engine.
+   * Starts the HTTP server and initialises the proxy transport.
    *
    * @returns A promise that resolves once the server is listening.
    */
   public start(): Promise<void> {
-    // Initialise fast-proxy with no fixed base URL so we can proxy to
-    // multiple different upstreams from a single gateway instance.
-    const { proxy, close } = buildFastProxy({
-      timeout: this.options.proxyTimeout,
-      // Tune the undici connection pool for high-throughput scenarios.
+    // Initialise the undici transport with no fixed base URL so we can proxy
+    // to multiple different upstreams from a single gateway instance.
+    const { request, close } = buildRequest({
       undici: {
         connections: 100,
         pipelining: 1,
       },
     });
 
-    this.proxy = proxy;
-    this.closeProxy = close;
+    this.requestFn = request;
+    this.closeTransport = close;
 
     return new Promise((resolve) => {
       this.server.listen(this.options.port, this.options.host, () => {
@@ -171,9 +206,9 @@ export class Gateway {
    */
   public stop(): Promise<void> {
     return new Promise((resolve, reject) => {
-      // Close the fast-proxy connection pool first to drain in-flight requests.
-      if (this.closeProxy) {
-        this.closeProxy();
+      // Drain the undici connection pool before closing the HTTP server.
+      if (this.closeTransport) {
+        this.closeTransport();
       }
 
       this.server.close((err) => {
@@ -198,7 +233,7 @@ export class Gateway {
    *  1. Match the request URL against the Radix-tree route table.
    *  2. Build a GatewayContext with request metadata.
    *  3. Compose and execute the middleware pipeline (global + route-level).
-   *  4. Stream the request to the upstream via fast-proxy.
+   *  4. Stream the request to the upstream via the undici transport.
    *
    * @param req - Native Node.js IncomingMessage.
    * @param res - Native Node.js ServerResponse.
@@ -274,42 +309,71 @@ export class Gateway {
   }
 
   /**
-   * Streams the request to the upstream service using fast-proxy.
+   * Streams the request to the upstream service using the undici transport
+   * from @fastify/reply-from.
    *
-   * fast-proxy handles:
-   *  - Forwarding all original headers.
+   * The transport handles:
+   *  - Forwarding all original headers (with hop-by-hop headers stripped).
    *  - Streaming the request body without buffering.
    *  - Streaming the upstream response body back to the client.
-   *  - Setting appropriate `x-forwarded-*` headers.
    *
    * @param ctx - The populated GatewayContext for this request.
    */
   private proxyRequest(ctx: GatewayContext): Promise<void> {
     return new Promise((resolve, reject) => {
-      // Build the full upstream URL by appending the original request path
-      // to the upstream base URL. This preserves path params and query strings.
-      const targetUrl = this.buildUpstreamUrl(ctx.upstream, ctx.req.url ?? '/');
+      const rawUrl = ctx.req.url ?? '/';
+      const upstreamUrl = this.buildUpstreamUrl(ctx.upstream, rawUrl);
 
-      this.proxy(ctx.req, ctx.res, targetUrl, {
-        // Instruct fast-proxy to rewrite the request URL to the target path.
-        rewriteRequestHeaders: (
-          _req: IncomingMessage,
-          headers: Record<string, string>
-        ) => {
-          // Inject a custom header so upstream services can identify
-          // traffic originating from the Jaunt gateway.
-          headers['x-forwarded-by'] = 'jaunt-gateway';
-          return headers;
+      // Extract the query string portion to pass separately, as the transport
+      // expects the path and query string to be provided independently.
+      const qs = upstreamUrl.search;
+
+      // Strip hop-by-hop headers (Connection, Transfer-Encoding, etc.) before
+      // forwarding, then inject the gateway identification header.
+      const forwardHeaders = stripHttp1ConnectionHeaders({
+        ...ctx.req.headers,
+      } as Record<string, string | string[] | undefined>);
+      forwardHeaders['x-forwarded-by'] = 'jaunt-gateway';
+      forwardHeaders['host'] = upstreamUrl.host;
+
+      this.requestFn(
+        {
+          method: ctx.req.method ?? 'GET',
+          url: upstreamUrl,
+          qs,
+          headers: forwardHeaders,
+          // Pass the raw IncomingMessage as the body stream so the transport
+          // can pipe it directly without buffering.
+          body: ctx.req,
+          timeout: this.options.proxyTimeout,
         },
-        onResponse: (_req: IncomingMessage, _res: ServerResponse) => {
-          // Called by fast-proxy once the upstream response has been fully
-          // piped to the client. Resolve the promise to signal completion.
-          resolve();
-        },
-        onError: (err: Error) => {
-          reject(err);
-        },
-      });
+        (err, upstreamRes) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+
+          // Write the upstream status and headers to the client response.
+          const outHeaders: Record<string, string | string[]> = {};
+          for (const [key, value] of Object.entries(upstreamRes.headers)) {
+            if (value !== undefined) {
+              outHeaders[key] = value;
+            }
+          }
+          ctx.res.writeHead(upstreamRes.statusCode, outHeaders);
+
+          // Stream the upstream response body directly to the client.
+          // `pipeline` handles cleanup on error or early close.
+          pipeline(upstreamRes.stream, ctx.res, (pipeErr) => {
+            if (pipeErr) {
+              // The client may have disconnected mid-stream; log but don't
+              // reject since the response head was already sent.
+              console.error('[Jaunt] Stream pipeline error:', pipeErr);
+            }
+            resolve();
+          });
+        }
+      );
     });
   }
 
@@ -318,27 +382,20 @@ export class Gateway {
   // ---------------------------------------------------------------------------
 
   /**
-   * Constructs the full upstream target URL.
+   * Constructs the full upstream target URL object.
    *
-   * Strips any existing origin from the upstream base and appends the
-   * incoming request's path + query string.
+   * Combines the upstream base origin with the incoming request's path
+   * and query string.
    *
    * @param upstream - The upstream base URL (e.g. 'http://user-service:3000').
    * @param requestUrl - The raw request URL including path and query string.
-   * @returns The fully-qualified upstream URL string.
+   * @returns A parsed URL pointing at the upstream target.
    */
-  private buildUpstreamUrl(upstream: string, requestUrl: string): string {
-    try {
-      const base = new URL(upstream);
-      // Combine the upstream origin with the incoming request path.
-      // Using URL constructor handles edge cases like double slashes.
-      const target = new URL(requestUrl, base.origin);
-      return target.toString();
-    } catch {
-      // Fallback: naive string concatenation if URL parsing fails.
-      // This should not happen with well-formed upstream values.
-      return upstream + requestUrl;
-    }
+  private buildUpstreamUrl(upstream: string, requestUrl: string): URL {
+    const base = new URL(upstream);
+    // Resolve the incoming path against the upstream origin.
+    // Using the URL constructor handles edge cases like double slashes.
+    return new URL(requestUrl, base.origin);
   }
 
   /**
@@ -362,7 +419,7 @@ export class Gateway {
   }
 
   /**
-   * Sends a plain-text HTTP error response and ends the response stream.
+   * Sends a JSON HTTP error response and ends the response stream.
    *
    * @param res - The ServerResponse to write to.
    * @param statusCode - HTTP status code (e.g. 404, 500).
