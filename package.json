@@ -1,0 +1,45 @@
+{
+  "name": "jaunt",
+  "version": "1.0.0",
+  "description": "A lightweight API Gateway core built on Node.js native HTTP, find-my-way, and fast-proxy.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "build:watch": "tsc -p tsconfig.build.json --watch",
+    "start:example": "ts-node examples/basic-gateway.ts",
+    "example:01": "ts-node examples/01-basic-proxy.ts",
+    "example:02": "ts-node examples/02-plugin-pipeline.ts",
+    "example:03": "ts-node examples/03-multi-upstream.ts",
+    "lint": "eslint 'src/**/*.ts' 'examples/**/*.ts'",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "api-gateway",
+    "proxy",
+    "router",
+    "middleware",
+    "nodejs",
+    "typescript",
+    "find-my-way",
+    "fast-proxy",
+    "jaunt"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "fast-proxy": "^1.0.0",
+    "find-my-way": "^9.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

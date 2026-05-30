@@ -1,0 +1,19 @@
+# macOS system files
+.DS_Store
+.DS_Store?
+
+# Dependencies
+node_modules/
+
+# Build/Coverage output
+dist/
+build/
+coverage/
+
+# IDE files
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
