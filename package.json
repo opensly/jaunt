@@ -14,6 +14,7 @@
     "example:01": "ts-node examples/01-basic-proxy.ts",
     "example:02": "ts-node examples/02-plugin-pipeline.ts",
     "example:03": "ts-node examples/03-multi-upstream.ts",
+    "example:04": "ts-node examples/04-http2-upstream.ts",
     "lint": "eslint 'src/**/*.ts' 'examples/**/*.ts'",
     "clean": "rm -rf dist"
   },
